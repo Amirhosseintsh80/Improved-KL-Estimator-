@@ -1,0 +1,151 @@
+
+library(MASS)
+
+# ------------------------------------------------------------------------------
+# SECTION 1: HELPER FUNCTIONS (RETAINED)
+# ------------------------------------------------------------------------------
+
+# 1.1 Poisson Kibria-Lukman (PKL) Estimator - Unrestricted
+get_pkl_poisson <- function(beta_input, S, k) {
+p <- length(beta_input)
+I <- diag(p)
+W_mat <- solve(S + k * I)
+M_mat <- (S - k * I)
+return(W_mat %*% M_mat %*% beta_input)}
+
+# 1.2 Restricted MLE (RMLE) Approximation
+get_restricted_mle <- function(beta_mle, S_inv, C, b) {
+  inner_inv <- solve(C %*% S_inv %*% t(C))
+  correction <- S_inv %*% t(C) %*% inner_inv %*% (C %*% beta_mle - b)
+  return(beta_mle - correction)}
+
+#Estimate k (MINIMUM Version)
+estimate_k_poisson_min <- function(beta_mle, S) {
+p <- length(beta_mle)
+eigen_decomp <- eigen(S)
+lambda <- eigen_decomp$values
+Q <- eigen_decomp$vectors
+alpha <- t(Q) %*% beta_mle 
+k_individual <- 1 / (2 * alpha^2 + (1 / lambda))
+return(min(k_individual))}
+
+#Wald Test Statistic
+get_wald_test <- function(beta_mle, S_inv, C, b) {
+diff <- C %*% beta_mle - b
+Var_Cbeta <- C %*% S_inv %*% t(C)
+Tn <- as.numeric(t(diff) %*% solve(Var_Cbeta) %*% diff)
+return(Tn)}
+
+# ------------------------------------------------------------------------------
+# SECTION 2: SIMULATION ENGINE (RETAINED)
+# ------------------------------------------------------------------------------
+
+run_extended_simulation_min_k <- function(n, p, rho, delta_val, n_rep = 1000) {
+
+mse_mle   <- 0; mse_rmle  <- 0; mse_pkl   <- 0
+mse_prkl  <- 0; mse_pskl  <- 0; mse_ppskl <- 0
+  
+q <- 3
+beta_true <- rep(0.4, p)
+beta_true[(p-q+1):p] <- c(delta_val, rep(0,2)) 
+  
+C <- matrix(0, nrow = q, ncol = p)
+for(i in 1:q) C[i, (p-q+i)] <- 1
+b_vec <- matrix(0, nrow = q, ncol = 1)
+  
+for (iter in 1:n_rep) {
+    
+# Data Generation
+Z <- matrix(rnorm(n * (p + 1)), nrow = n, ncol = p + 1)
+X <- matrix(0, nrow = n, ncol = p)
+for (i in 1:n) {for (j in 1:p) {X[i, j] <- sqrt(1 - rho^2) * Z[i, j] + rho * Z[i, p + 1]}}
+X <- scale(X)
+mu_true <- exp(X %*% beta_true)
+y <- rpois(n, lambda = mu_true)
+    
+# Estimation
+model <- tryCatch(glm(y ~ X - 1, family = "poisson"), warning=function(w) NULL, error=function(e) NULL)
+if(is.null(model) || any(is.na(coef(model)))) next
+
+beta_mle <- coef(model)
+mu_hat <- fitted(model)
+W <- diag(mu_hat)
+S <- t(X) %*% W %*% X
+S_inv <- tryCatch(solve(S), error=function(e) return(NULL))
+if(is.null(S_inv)) next
+
+# Estimator Construction
+k_opt <- estimate_k_poisson_min(beta_mle, S)
+beta_pkl <- get_pkl_poisson(beta_mle, S, k_opt)
+beta_rmle <- get_restricted_mle(beta_mle, S_inv, C, b_vec)
+beta_prkl <- get_pkl_poisson(beta_rmle, S, k_opt)
+    
+Tn <- get_wald_test(beta_mle, S_inv, C, b_vec)
+shrinkage <- 1 - (q - 2) / Tn
+    
+beta_pskl <- beta_prkl + shrinkage * (beta_pkl - beta_prkl)
+beta_ppskl <- beta_prkl + max(0, shrinkage) * (beta_pkl - beta_prkl)
+    
+# Accumulate MSE
+mse_pkl   <- mse_pkl + sum((beta_pkl - beta_true)^2)
+mse_prkl  <- mse_prkl + sum((beta_prkl - beta_true)^2) 
+mse_pskl  <- mse_pskl + sum((beta_pskl - beta_true)^2)
+mse_ppskl <- mse_ppskl + sum((beta_ppskl - beta_true)^2)}
+  
+# Return final MSEs for RE calculation
+return(c(Delta = delta_val,
+    MSE_PKL = mse_pkl / n_rep,
+    MSE_PRKL = mse_prkl / n_rep,
+    MSE_PSKL = mse_pskl / n_rep,
+    MSE_PPSKL = mse_ppskl / n_rep))}
+
+# ------------------------------------------------------------------------------
+# SECTION 3: TABULAR REPORTING MANAGER
+# ------------------------------------------------------------------------------
+
+# Define Scenario Parameters
+N_values <- c(100, 200, 400) 
+P_values <- c(8, 16)         
+RHO_fixed <- 0.99         
+DELTA_sequence <- seq(0, 1, by = 0.2) 
+
+cat(sprintf("--- Generating Tabular Report for Rho = %.2f ---\n", RHO_fixed))
+
+# Loop over all 6 scenarios (p=8 and p=16)
+for (p_val in P_values) {
+  for (n_val in N_values) {
+    
+    cat(sprintf("\nScenario: n=%d, p=%d\n", n_val, p_val))
+    cat("----------------------------------\n")
+    
+    # Dataframe to store results for one scenario (one table)
+    Scenario_Table <- data.frame(Delta = DELTA_sequence)
+    
+    # Loop over Delta values (X-axis)
+    for (d_val in DELTA_sequence) { 
+      
+      res <- run_extended_simulation_min_k(n=n_val, p=p_val, rho=RHO_fixed, 
+                                           delta_val=d_val, n_rep=1000) 
+      
+      mse_pkl_base <- res["MSE_PKL"]
+      
+      # Calculate RE for all relevant estimators (Base = PKL)
+      re_prkl <- mse_pkl_base / res["MSE_PRKL"]
+      re_pskl <- mse_pkl_base / res["MSE_PSKL"]
+      re_ppskl <- mse_pkl_base / res["MSE_PPSKL"]
+      
+# Append RE values to the scenario dataframe
+Scenario_Table[Scenario_Table$Delta == d_val, "Delta"] <- d_val
+Scenario_Table[Scenario_Table$Delta == d_val, "RE_PRKL"] <- re_prkl
+Scenario_Table[Scenario_Table$Delta == d_val, "RE_PSKL"] <- re_pskl
+Scenario_Table[Scenario_Table$Delta == d_val, "RE_PPSKL"] <- re_ppskl}
+
+# Formatting and printing the table
+colnames(Scenario_Table) <- c("Delta", "PRKL", "PSKL", "PPSKL")
+    
+# Rounding for clean tabular output
+Scenario_Table[, 2:4] <- round(Scenario_Table[, 2:4], 3)
+
+# Display the results
+print(Scenario_Table)}}
+
