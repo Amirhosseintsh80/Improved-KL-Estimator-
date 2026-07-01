@@ -1,0 +1,317 @@
+library(ISLR)
+library(car)
+library(glmnet)
+library(MASS)
+library(dplyr)
+
+data("Hitters")
+df <- na.omit(Hitters)
+vars <- c("AtBat", "Hits", "HmRun", "RBI", "Walks", 
+          "CAtBat", "CHits", "CHmRun", "CRuns", "CRBI", "CWalks")
+
+temp_model <- glm(as.formula(paste("Runs ~", paste(vars, collapse="+"))), 
+                  family="poisson", data=df)
+df_clean <- df[abs(rstandard(temp_model)) < 4, ]
+
+# Goodness of Fit Test
+final_model <- glm(as.formula(paste("Runs ~", paste(vars, collapse="+"))), 
+                   family="poisson", data=df_clean)
+p_value_gof <- pchisq(final_model$deviance, df.residual(final_model), lower.tail = FALSE)
+
+cat(">>> 1. Goodness of Fit Test:\n")
+cat("Remaining observations:", nrow(df_clean), "\n")
+cat("P value:", format.pval(p_value_gof), "\n")
+if(p_value_gof > 0.05) cat("Poisson model fit accepted\n") else cat("Fit is still poor\n")
+
+# Multicollinearity Check
+cat("\n>>> 2. Variance Inflation Factor values:\n")
+print(vif(final_model))
+
+# Lasso Execution
+x <- as.matrix(df_clean[, vars])
+y <- df_clean$Runs
+
+set.seed(123)
+lasso_cv <- cv.glmnet(x, y, family = "poisson", alpha = 1)
+lasso_coefs <- as.matrix(coef(lasso_cv, s = "lambda.min"))
+
+cat("\n>>> 3. Lasso Results Selected Variables:\n")
+print(lasso_coefs[lasso_coefs != 0, , drop=FALSE])
+
+# SECTION 1: HELPER FUNCTIONS
+
+# Poisson Kibria Lukman Estimator Unrestricted
+get_pkl_poisson <- function(beta_input, S, k) {
+  p <- length(beta_input)
+  I <- diag(p)
+  W_mat <- solve(S + k * I)
+  M_mat <- (S - k * I)
+  return(W_mat %*% M_mat %*% beta_input)
+}
+
+# Restricted Maximum Likelihood Approximation
+get_restricted_mle <- function(beta_mle, S_inv, C, b) {
+  inner_inv <- solve(C %*% S_inv %*% t(C))
+  correction <- S_inv %*% t(C) %*% inner_inv %*% (C %*% beta_mle - b)
+  return(beta_mle - correction)
+}
+
+# Estimate Minimum k 
+estimate_k_poisson_min <- function(beta_mle, S) {
+  p <- length(beta_mle)
+  eigen_decomp <- eigen(S)
+  lambda <- eigen_decomp$values
+  Q <- eigen_decomp$vectors
+  alpha <- t(Q) %*% beta_mle 
+  k_individual <- 1 / (2 * alpha^2 + (1 / lambda))
+  return(min(k_individual))
+}
+
+# Wald Test Statistic
+get_wald_test <- function(beta_mle, S_inv, C, b) {
+  diff <- C %*% beta_mle - b
+  Var_Cbeta <- C %*% S_inv %*% t(C)
+  Tn <- as.numeric(t(diff) %*% solve(Var_Cbeta) %*% diff)
+  return(Tn)
+}
+
+# SECTION 2: EXTENDED SIMULATION FOR ALL VARIABLES
+
+run_complete_simulation <- function(df_clean, n_rep = 1000) {
+  p <- length(vars)
+  
+  X <- as.matrix(df_clean[, vars])
+  X <- scale(X)
+  y <- df_clean$Runs
+  
+  base_model <- glm(y ~ X - 1, family = "poisson")
+  beta_true <- coef(base_model)
+  names(beta_true) <- vars
+  
+  C <- matrix(0, nrow = 3, ncol = p)
+  colnames(C) <- vars
+  
+  idx_cwalks <- which(vars == "CWalks")
+  idx_crbi <- which(vars == "CRBI")
+  idx_catbat <- which(vars == "CAtBat")
+  
+  C[1, idx_cwalks] <- 1
+  C[2, idx_crbi] <- 1
+  C[3, idx_catbat] <- 1
+  
+  b_vec <- matrix(0, nrow = 3, ncol = 1)
+  
+  Sigma <- cov(X)
+  n_obs <- nrow(X)
+  
+  beta_mle_all <- matrix(0, nrow = n_rep, ncol = p)
+  beta_pkl_all <- matrix(0, nrow = n_rep, ncol = p)
+  beta_prkl_all <- matrix(0, nrow = n_rep, ncol = p)
+  beta_pskl_all <- matrix(0, nrow = n_rep, ncol = p)
+  beta_ppskl_all <- matrix(0, nrow = n_rep, ncol = p)
+  
+  colnames(beta_mle_all) <- vars
+  colnames(beta_pkl_all) <- vars
+  colnames(beta_prkl_all) <- vars
+  colnames(beta_pskl_all) <- vars
+  colnames(beta_ppskl_all) <- vars
+  
+  valid_rep <- 0
+  
+  for (iter in 1:n_rep) {
+    Z <- mvrnorm(n = n_obs, mu = rep(0, p), Sigma = Sigma)
+    Z <- scale(Z)
+    
+    mu_sim <- exp(Z %*% beta_true)
+    y_sim <- rpois(n_obs, lambda = mu_sim)
+    
+    model <- tryCatch(
+      glm(y_sim ~ Z - 1, family = "poisson"),
+      warning = function(w) NULL,
+      error = function(e) NULL
+    )
+    
+    if (is.null(model) || any(is.na(coef(model)))) next
+    
+    beta_mle <- coef(model)
+    mu_hat <- fitted(model)
+    W <- diag(mu_hat)
+    S <- t(Z) %*% W %*% Z
+    S_inv <- tryCatch(solve(S), error = function(e) return(NULL))
+    
+    if (is.null(S_inv)) next
+    
+    k_opt <- estimate_k_poisson_min(beta_mle, S)
+    beta_pkl <- get_pkl_poisson(beta_mle, S, k_opt)
+    beta_rmle <- get_restricted_mle(beta_mle, S_inv, C, b_vec)
+    beta_prkl <- get_pkl_poisson(beta_rmle, S, k_opt)
+    
+    Tn <- get_wald_test(beta_mle, S_inv, C, b_vec)
+    shrinkage <- 1 - (3 - 2) / Tn
+    
+    beta_pskl <- beta_prkl + shrinkage * (beta_pkl - beta_prkl)
+    beta_ppskl <- beta_prkl + max(0, shrinkage) * (beta_pkl - beta_prkl)
+    
+    valid_rep <- valid_rep + 1
+    beta_mle_all[valid_rep, ] <- beta_mle
+    beta_pkl_all[valid_rep, ] <- beta_pkl
+    beta_prkl_all[valid_rep, ] <- beta_prkl
+    beta_pskl_all[valid_rep, ] <- beta_pskl
+    beta_ppskl_all[valid_rep, ] <- beta_ppskl
+  }
+  
+  beta_mle_all <- beta_mle_all[1:valid_rep, ]
+  beta_pkl_all <- beta_pkl_all[1:valid_rep, ]
+  beta_prkl_all <- beta_prkl_all[1:valid_rep, ]
+  beta_pskl_all <- beta_pskl_all[1:valid_rep, ]
+  beta_ppskl_all <- beta_ppskl_all[1:valid_rep, ]
+  
+  results_list <- list()
+  for (i in 1:p) {
+    var_name <- vars[i]
+    
+    mle_est <- mean(beta_mle_all[, i])
+    mle_sd <- sd(beta_mle_all[, i])
+    
+    pkl_est <- mean(beta_pkl_all[, i])
+    pkl_sd <- sd(beta_pkl_all[, i])
+    
+    prkl_est <- mean(beta_prkl_all[, i])
+    prkl_sd <- sd(beta_prkl_all[, i])
+    
+    pskl_est <- mean(beta_pskl_all[, i])
+    pskl_sd <- sd(beta_pskl_all[, i])
+    
+    ppskl_est <- mean(beta_ppskl_all[, i])
+    ppskl_sd <- sd(beta_ppskl_all[, i])
+    
+    mse_mle <- mean((beta_mle_all[, i] - beta_true[i])^2)
+    mse_pkl <- mean((beta_pkl_all[, i] - beta_true[i])^2)
+    mse_prkl <- mean((beta_prkl_all[, i] - beta_true[i])^2)
+    mse_pskl <- mean((beta_pskl_all[, i] - beta_true[i])^2)
+    mse_ppskl <- mean((beta_ppskl_all[, i] - beta_true[i])^2)
+    
+    re_pkl <- mse_pkl / mse_pkl
+    re_prkl <- mse_pkl / mse_prkl
+    re_pskl <- mse_pkl / mse_pskl
+    re_ppskl <- mse_pkl / mse_ppskl
+    
+    results_list[[var_name]] <- data.frame(
+      Variable = var_name,
+      MLE_est = mle_est,
+      MLE_sd = mle_sd,
+      PKL_est = pkl_est,
+      PKL_sd = pkl_sd,
+      PRKL_est = prkl_est,
+      PRKL_sd = prkl_sd,
+      PSKL_est = pskl_est,
+      PSKL_sd = pskl_sd,
+      PPSKL_est = ppskl_est,
+      PPSKL_sd = ppskl_sd,
+      RE_PKL = re_pkl,
+      RE_PRKL = re_prkl,
+      RE_PSKL = re_pskl,
+      RE_PPSKL = re_ppskl
+    )
+  }
+  
+  results_df <- do.call(rbind, results_list)
+  rownames(results_df) <- NULL
+  
+  return(list(
+    detailed_results = results_df,
+    beta_matrices = list(
+      MLE = beta_mle_all,
+      PKL = beta_pkl_all,
+      PRKL = beta_prkl_all,
+      PSKL = beta_pskl_all,
+      PPSKL = beta_ppskl_all
+    ),
+    n_valid_reps = valid_rep
+  ))
+}
+
+# SECTION 3: EXECUTION AND RESULTS DISPLAY
+
+cat("Complete Monte Carlo Simulation for Hitters Data\n")
+cat("=============================================\n")
+cat("Variables Used 11 variables:\n")
+cat(paste(vars, collapse = ", "), "\n")
+cat("\n")
+cat("Applied Restrictions Zero Coefficients:\n")
+cat("1. CWalks equals 0\n")
+cat("2. CRBI equals 0\n")
+cat("3. CAtBat equals 0\n")
+cat("\n")
+
+set.seed(123)
+simulation_results <- run_complete_simulation(df_clean, n_rep = 1000)
+cat(sprintf("Number of Valid Replications: %d\n", simulation_results$n_valid_reps))
+cat("\n")
+
+results_df <- simulation_results$detailed_results
+
+cat("Table Estimates Standard Deviations and Relative Efficiencies for Hitters Data\n")
+cat("=========================================================================\n\n")
+
+for (i in 1:nrow(results_df)) {
+  var_info <- results_df[i, ]
+  
+  cat(sprintf("Variable: %s\n", var_info$Variable))
+  cat("-------------------------------------------------------------------------\n")
+  
+  sub_table <- data.frame(
+    Estimator = c("MLE", "PKL", "PRKL", "PSKL", "PPSKL"),
+    Estimate = c(
+      sprintf("%.3f", var_info$MLE_est),
+      sprintf("%.3f", var_info$PKL_est),
+      sprintf("%.3f", var_info$PRKL_est),
+      sprintf("%.3f", var_info$PSKL_est),
+      sprintf("%.3f", var_info$PPSKL_est)
+    ),
+    StandardDeviation = c(
+      sprintf("%.3f", var_info$MLE_sd),
+      sprintf("%.3f", var_info$PKL_sd),
+      sprintf("%.3f", var_info$PRKL_sd),
+      sprintf("%.3f", var_info$PSKL_sd),
+      sprintf("%.3f", var_info$PPSKL_sd)
+    ),
+    RelativeEfficiency = c(
+      "1.000",
+      sprintf("%.3f", var_info$RE_PKL),
+      sprintf("%.3f", var_info$RE_PRKL),
+      sprintf("%.3f", var_info$RE_PSKL),
+      sprintf("%.3f", var_info$RE_PPSKL)
+    )
+  )
+  
+  print(sub_table)
+  cat("\n")
+}
+
+cat("\nSummary of Relative Efficiencies Averages across all variables:\n")
+cat("-----------------------------------------------\n")
+
+mean_re <- data.frame(
+  Estimator = c("PKL", "PRKL", "PSKL", "PPSKL"),
+  Mean_RE = c(
+    mean(results_df$RE_PKL),
+    mean(results_df$RE_PRKL),
+    mean(results_df$RE_PSKL),
+    mean(results_df$RE_PPSKL)
+  ),
+  Min_RE = c(
+    min(results_df$RE_PKL),
+    min(results_df$RE_PRKL),
+    min(results_df$RE_PSKL),
+    min(results_df$RE_PPSKL)
+  ),
+  Max_RE = c(
+    max(results_df$RE_PKL),
+    max(results_df$RE_PRKL),
+    max(results_df$RE_PSKL),
+    max(results_df$RE_PPSKL)
+  )
+)
+
+print(mean_re)
